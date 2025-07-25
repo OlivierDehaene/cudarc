@@ -1,8 +1,63 @@
 use super::{result, sys};
-use crate::driver::{CudaContext, CudaStream, DevicePtr, DevicePtrMut};
+use crate::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr};
+use core::fmt::Debug;
+use core::marker::PhantomData;
+use std::boxed::Box;
 use std::{mem::MaybeUninit, sync::Arc, vec, vec::Vec};
 
+use crate::driver;
+use crate::driver::core::DevicePtrRepr;
+use crate::driver::sys::CUdeviceptr;
 pub use result::{group_end, group_start};
+
+#[derive(Debug)]
+enum Registration {
+    UB(*mut core::ffi::c_void, Arc<Comm>),
+    Window(sys::ncclWindow_t, Arc<Comm>),
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        unsafe {
+            match self {
+                Registration::UB(handle, comm) => {
+                    result::comm_deregister(comm.comm, *handle).unwrap();
+                }
+                Registration::Window(window, comm) => {
+                    result::comm_window_deregister(comm.comm, *window).unwrap();
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct NcclSlice<T> {
+    cu_device_ptr: CUdeviceptr,
+    stream: Arc<CudaStream>,
+    marker: PhantomData<T>,
+    #[allow(dead_code)]
+    registration: Registration,
+}
+
+impl<T: Debug> DevicePtrRepr for NcclSlice<T> {
+    fn device_ptr(&self) -> &CUdeviceptr {
+        &self.cu_device_ptr
+    }
+
+    fn device_ptr_mut(&mut self) -> &mut CUdeviceptr {
+        &mut self.cu_device_ptr
+    }
+}
+
+impl<T> Drop for NcclSlice<T> {
+    fn drop(&mut self) {
+        self.stream.context().bind_to_thread().unwrap();
+        unsafe {
+            result::mem_free(self.cu_device_ptr as *mut core::ffi::c_void).unwrap();
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct Comm {
@@ -109,7 +164,9 @@ impl Comm {
     /// });
     /// group_start().unwrap();
     /// ```
-    pub fn from_devices(streams: Vec<Arc<CudaStream>>) -> Result<Vec<Self>, result::NcclError> {
+    pub fn from_devices(
+        streams: Vec<Arc<CudaStream>>,
+    ) -> Result<Vec<Self>, result::NcclError> {
         let n_streams = streams.len();
         let mut comms = vec![std::ptr::null_mut(); n_streams];
         let ordinals: Vec<_> = streams
@@ -124,11 +181,13 @@ impl Comm {
             .into_iter()
             .zip(streams.iter().cloned())
             .enumerate()
-            .map(|(rank, (comm, stream))| Self {
-                comm,
-                stream,
-                rank,
-                world_size: n_streams,
+            .map(|(rank, (comm, stream))| {
+                Self {
+                    comm,
+                    stream,
+                    rank,
+                    world_size: n_streams,
+                }
             })
             .collect();
 
@@ -205,6 +264,78 @@ impl Comm {
             stream,
             rank,
             world_size,
+        })
+    }
+
+    pub fn register<T: DeviceRepr + Debug + 'static>(
+        self: &Arc<Self>,
+        len: usize,
+    ) -> Result<CudaSlice<T>, result::NcclError> {
+        self.context()
+            .bind_to_thread()
+            .map_err(|_| result::NcclError(sys::ncclResult_t::ncclInternalError))?;
+
+        let num_bytes = len * size_of::<T>();
+
+        let dev_ptr = unsafe {
+            let mut dev_ptr = MaybeUninit::uninit();
+            result::mem_alloc(dev_ptr.as_mut_ptr(), num_bytes)?;
+            dev_ptr.assume_init()
+        };
+        let handle = unsafe {
+            let mut handle = MaybeUninit::uninit();
+            result::comm_register(self.comm, dev_ptr, num_bytes, handle.as_mut_ptr())?;
+            handle.assume_init()
+        };
+
+        let nccl_slice: NcclSlice<T> = NcclSlice {
+            cu_device_ptr: dev_ptr as CUdeviceptr,
+            stream: self.stream.clone(),
+            registration: Registration::UB(handle, self.clone()),
+            marker: PhantomData,
+        };
+
+        Ok(unsafe {
+            self.stream.upgrade_device_ptr(
+                driver::safe::core::CuDevicePtr::Shared(Box::new(nccl_slice), self.stream.clone()),
+                len,
+            )
+        })
+    }
+
+    pub fn window_register<T: DeviceRepr + Debug + 'static>(
+        self: &Arc<Self>,
+        len: usize,
+    ) -> Result<CudaSlice<T>, result::NcclError> {
+        self.context()
+            .bind_to_thread()
+            .map_err(|_| result::NcclError(sys::ncclResult_t::ncclInternalError))?;
+
+        let num_bytes = len * size_of::<T>();
+
+        let dev_ptr = unsafe {
+            let mut dev_ptr = MaybeUninit::uninit();
+            result::mem_alloc(dev_ptr.as_mut_ptr(), num_bytes)?;
+            dev_ptr.assume_init()
+        };
+        let window = unsafe {
+            let mut window = MaybeUninit::uninit();
+            result::comm_window_register(self.comm, dev_ptr, num_bytes, window.as_mut_ptr())?;
+            window.assume_init()
+        };
+
+        let nccl_slice: NcclSlice<T> = NcclSlice {
+            cu_device_ptr: dev_ptr as CUdeviceptr,
+            stream: self.stream.clone(),
+            registration: Registration::Window(window, self.clone()),
+            marker: PhantomData,
+        };
+
+        Ok(unsafe {
+            self.stream.upgrade_device_ptr(
+                driver::safe::core::CuDevicePtr::Shared(Box::new(nccl_slice), self.stream.clone()),
+                len,
+            )
         })
     }
 }
@@ -461,14 +592,17 @@ mod tests {
     use super::*;
     #[cfg(feature = "no-std")]
     use no_std_compat::println;
+    use std::sync::Barrier;
 
     #[test]
     fn test_all_reduce() {
         let n = 2;
         let n_devices = CudaContext::device_count().unwrap() as usize;
         let id = Id::new().unwrap();
+        let barrier = Arc::new(Barrier::new(n_devices));
         let threads: Vec<_> = (0..n_devices)
             .map(|i| {
+                let local_barrier = barrier.clone();
                 println!("III {i}");
                 std::thread::spawn(move || {
                     println!("Within thread {i}");
@@ -477,6 +611,9 @@ mod tests {
                     let comm = Comm::from_rank(stream.clone(), i, n_devices, id).unwrap();
                     let slice = stream.memcpy_stod(&vec![(i + 1) as f32 * 1.0; n]).unwrap();
                     let mut slice_receive = stream.alloc_zeros::<f32>(n).unwrap();
+
+                    local_barrier.wait();
+
                     comm.all_reduce(&slice, &mut slice_receive, &ReduceOp::Sum)
                         .unwrap();
 
@@ -492,12 +629,98 @@ mod tests {
     }
 
     #[test]
+    fn test_all_reduce_ub() {
+        let n = 2;
+        let n_devices = CudaContext::device_count().unwrap() as usize;
+        let id = Id::new().unwrap();
+        let barrier = Arc::new(Barrier::new(n_devices));
+        let threads: Vec<_> = (0..n_devices)
+            .map(|i| {
+                let local_barrier = barrier.clone();
+                println!("III {i}");
+                std::thread::spawn(move || {
+                    println!("Within thread {i}");
+                    let ctx = CudaContext::new(i).unwrap();
+                    let stream = ctx.default_stream();
+                    let comm = Arc::new(Comm::from_rank(stream.clone(), i, n_devices, id).unwrap());
+
+                    let slice = comm.register(n).unwrap();
+                    stream
+                        .memcpy_htod(&vec![(i + 1) as f32 * 1.0; n], &mut slice.as_view_mut())
+                        .unwrap();
+                    let slice_receive = comm.window_register(n).unwrap();
+
+                    local_barrier.wait();
+
+                    comm.all_reduce(
+                        &slice.as_view(),
+                        &mut slice_receive.as_view_mut(),
+                        &ReduceOp::Sum,
+                    )
+                    .unwrap();
+
+                    let out = stream.memcpy_dtov(&slice_receive.as_view()).unwrap();
+
+                    assert_eq!(out, vec![(n_devices * (n_devices + 1)) as f32 / 2.0; n]);
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap()
+        }
+    }
+
+    #[test]
+    fn test_all_reduce_symmetric() {
+        let n = 2;
+        let n_devices = CudaContext::device_count().unwrap() as usize;
+        let id = Id::new().unwrap();
+        let barrier = Arc::new(Barrier::new(n_devices));
+        let threads: Vec<_> = (0..n_devices)
+            .map(|i| {
+                let local_barrier = barrier.clone();
+                println!("III {i}");
+                std::thread::spawn(move || {
+                    println!("Within thread {i}");
+                    let ctx = CudaContext::new(i).unwrap();
+                    let stream = ctx.default_stream();
+                    let comm = Arc::new(Comm::from_rank(stream.clone(), i, n_devices, id).unwrap());
+
+                    let slice = comm.window_register(n).unwrap();
+                    stream
+                        .memcpy_htod(&vec![(i + 1) as f32 * 1.0; n], &mut slice.as_view_mut())
+                        .unwrap();
+                    let slice_receive = comm.window_register(n).unwrap();
+
+                    local_barrier.wait();
+
+                    comm.all_reduce(
+                        &slice.as_view(),
+                        &mut slice_receive.as_view_mut(),
+                        &ReduceOp::Sum,
+                    )
+                    .unwrap();
+
+                    let out = stream.memcpy_dtov(&slice_receive.as_view()).unwrap();
+
+                    assert_eq!(out, vec![(n_devices * (n_devices + 1)) as f32 / 2.0; n]);
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap()
+        }
+    }
+
+    #[test]
     fn test_all_reduce_views() {
         let n = 2;
         let n_devices = CudaContext::device_count().unwrap() as usize;
         let id = Id::new().unwrap();
+        let barrier = Arc::new(Barrier::new(n_devices));
         let threads: Vec<_> = (0..n_devices)
             .map(|i| {
+                let local_barrier = barrier.clone();
                 println!("III {i}");
                 std::thread::spawn(move || {
                     println!("Within thread {i}");
@@ -508,6 +731,8 @@ mod tests {
                     let mut slice_receive = stream.alloc_zeros::<f32>(n).unwrap();
                     let slice_view = slice.slice(..);
                     let mut slice_receive_view = slice_receive.slice_mut(..);
+
+                    local_barrier.wait();
 
                     comm.all_reduce(&slice_view, &mut slice_receive_view, &ReduceOp::Sum)
                         .unwrap();

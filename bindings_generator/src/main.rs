@@ -27,19 +27,19 @@ lazy_static! {
 /// The cuda versions we're building against.
 /// Those are the feature names used in cudarc
 const CUDA_VERSIONS: &[&str] = &[
-    "cuda-11040",
-    "cuda-11050",
-    "cuda-11060",
-    "cuda-11070",
-    "cuda-11080",
-    "cuda-12000",
-    "cuda-12010",
-    "cuda-12020",
-    "cuda-12030",
-    "cuda-12040",
-    "cuda-12050",
-    "cuda-12060",
-    "cuda-12080",
+    // "cuda-11040",
+    // "cuda-11050",
+    // "cuda-11060",
+    // "cuda-11070",
+    // "cuda-11080",
+    // "cuda-12000",
+    // "cuda-12010",
+    // "cuda-12020",
+    // "cuda-12030",
+    // "cuda-12040",
+    // "cuda-12050",
+    // "cuda-12060",
+    // "cuda-12080",
     "cuda-12090",
 ];
 
@@ -193,7 +193,7 @@ fn create_modules() -> Vec<(String, ModuleConfig)> {
                 libs: vec!["nccl".to_string()],
                 redist: Some(Redist {
                     url: "https://developer.download.nvidia.com/compute/redist/nccl/".to_string(),
-                    version: "2.26.2".to_string(),
+                    version: "2.27.6".to_string(),
                 }),
             },
         ),
@@ -933,7 +933,7 @@ fn generate_nccl(
     let url = &redist.url;
     let version = &redist.version;
 
-    let path = format!("v{}/nccl_{}-1+cuda12.8_x86_64.txz", version, version);
+    let path = format!("v{}/nccl_{}-1+cuda12.9_x86_64.txz", version, version);
     let full_url = format!("{}/{}", url, path);
     log::debug!("{}", full_url);
 

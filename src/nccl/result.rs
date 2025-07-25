@@ -1,6 +1,6 @@
 //! A thin wrapper around [sys] providing [Result]s with [NcclError].
 
-use super::sys::{self};
+use super::sys::{self, ncclComm_t, ncclWindow_t};
 use std::mem::MaybeUninit;
 
 /// Wrapper around [sys::ncclResult_t].
@@ -308,6 +308,70 @@ pub fn group_end() -> Result<NcclStatus, NcclError> {
 /// See [cuda docs](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/api/group.html?ncclgroupstart)
 pub fn group_start() -> Result<NcclStatus, NcclError> {
     unsafe { sys::ncclGroupStart().result() }
+}
+
+/// See [cuda docs](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/api/comms.html#ncclmemalloc)
+/// # Safety
+/// User is in charge of sending valid pointers.
+pub unsafe fn mem_alloc(
+    ptr: *mut *mut ::core::ffi::c_void,
+    size: usize,
+) -> Result<NcclStatus, NcclError> {
+    sys::ncclMemAlloc(ptr, size).result()
+}
+
+/// See [cuda docs](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/api/comms.html#ncclmemfree)
+/// # Safety
+/// User is in charge of sending valid pointers.
+pub unsafe fn mem_free(ptr: *mut ::core::ffi::c_void) -> Result<NcclStatus, NcclError> {
+    sys::ncclMemFree(ptr).result()
+}
+
+/// See [cuda docs](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/api/comms.html#ncclcommregister)
+/// # Safety
+/// User is in charge of sending valid pointers.
+pub unsafe fn comm_register(
+    comm: ncclComm_t,
+    buff: *mut ::core::ffi::c_void,
+    size: usize,
+    handle: *mut *mut ::core::ffi::c_void,
+) -> Result<NcclStatus, NcclError> {
+    sys::ncclCommRegister(comm, buff, size, handle).result()
+}
+
+/// See [cuda docs](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/api/comms.html#ncclcommderegister)
+/// # Safety
+/// User is in charge of sending valid pointers.
+pub unsafe fn comm_deregister(
+    comm: ncclComm_t,
+    handle: *mut ::core::ffi::c_void,
+) -> Result<NcclStatus, NcclError> {
+    sys::ncclCommDeregister(comm, handle).result()
+}
+
+/// See [cuda docs](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/api/comms.html#ncclcommwindowregister)
+/// # Safety
+/// User is in charge of sending valid pointers.
+pub unsafe fn comm_window_register(
+    comm: ncclComm_t,
+    buff: *mut ::core::ffi::c_void,
+    size: usize,
+    win: *mut ncclWindow_t,
+) -> Result<NcclStatus, NcclError> {
+    sys::ncclCommWindowRegister(
+        comm, buff, size, win, 1, // NCCL_WIN_COLL_SYMMETRIC
+    )
+    .result()
+}
+
+/// See [cuda docs](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/api/comms.html#ncclcommwindowderegister)
+/// # Safety
+/// User is in charge of sending valid pointers.
+pub unsafe fn comm_window_deregister(
+    comm: ncclComm_t,
+    win: ncclWindow_t,
+) -> Result<NcclStatus, NcclError> {
+    sys::ncclCommWindowDeregister(comm, win).result()
 }
 
 #[cfg(test)]

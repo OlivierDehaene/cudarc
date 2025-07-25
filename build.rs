@@ -214,6 +214,8 @@ fn link_searches(major: usize, minor: usize) -> Vec<PathBuf> {
         "CUDA_ROOT",
         "CUDA_TOOLKIT_ROOT_DIR",
         "CUDNN_LIB",
+        "CUDA_HOME",
+        "NCCL_HOME",
     ];
     let env_vars = env_vars
         .into_iter()

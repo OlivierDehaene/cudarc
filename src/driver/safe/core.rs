@@ -2,7 +2,9 @@ use crate::driver::{
     result::{self, DriverError},
     sys::{self, CUfunc_cache_enum, CUfunction_attribute_enum},
 };
+use core::fmt::Debug;
 use core::ops::{Deref, DerefMut};
+use std::boxed::Box;
 
 use std::{
     ffi::CString,
@@ -546,6 +548,11 @@ impl CudaStream {
     }
 }
 
+pub trait DevicePtrRepr: Debug {
+    fn device_ptr(&self) -> &sys::CUdeviceptr;
+    fn device_ptr_mut(&mut self) -> &mut sys::CUdeviceptr;
+}
+
 /// A wrapper around [sys::CUdeviceptr].
 /// Shared variant is required for interop with other frameworks.
 /// If shared variant is used, it is up to the user to manually drop the pointer and ensure
@@ -553,7 +560,7 @@ impl CudaStream {
 #[derive(Debug)]
 pub enum CuDevicePtr {
     Owned(sys::CUdeviceptr, Arc<CudaStream>),
-    Shared(sys::CUdeviceptr, Arc<CudaStream>),
+    Shared(Box<dyn DevicePtrRepr>, Arc<CudaStream>),
 }
 
 impl Deref for CuDevicePtr {
@@ -562,7 +569,7 @@ impl Deref for CuDevicePtr {
     fn deref(&self) -> &Self::Target {
         match self {
             CuDevicePtr::Owned(cu_device_ptr, _) => cu_device_ptr,
-            CuDevicePtr::Shared(cu_device_ptr, _) => cu_device_ptr,
+            CuDevicePtr::Shared(cu_device_ptr, _) => cu_device_ptr.device_ptr(),
         }
     }
 }
@@ -571,7 +578,7 @@ impl DerefMut for CuDevicePtr {
     fn deref_mut(&mut self) -> &mut Self::Target {
         match self {
             CuDevicePtr::Owned(cu_device_ptr, _) => cu_device_ptr,
-            CuDevicePtr::Shared(cu_device_ptr, _) => cu_device_ptr,
+            CuDevicePtr::Shared(cu_device_ptr, _) => cu_device_ptr.device_ptr_mut(),
         }
     }
 }
@@ -673,7 +680,7 @@ pub struct CudaView<'a, T> {
     pub(crate) read: &'a Option<CudaEvent>,
     pub(crate) write: &'a Option<CudaEvent>,
     pub(crate) stream: &'a Arc<CudaStream>,
-    marker: PhantomData<&'a [T]>,
+    pub(crate) marker: PhantomData<&'a [T]>,
 }
 
 impl<T> CudaSlice<T> {
@@ -720,7 +727,7 @@ pub struct CudaViewMut<'a, T> {
     pub(crate) read: &'a Option<CudaEvent>,
     pub(crate) write: &'a Option<CudaEvent>,
     pub(crate) stream: &'a Arc<CudaStream>,
-    marker: PhantomData<&'a mut [T]>,
+    pub(crate) marker: PhantomData<&'a mut [T]>,
 }
 
 impl<T> CudaSlice<T> {
